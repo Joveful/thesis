@@ -167,7 +167,7 @@ class MovingAverageForecaster:
 
 @register_forecaster
 class ARIMAForecaster:
-    """ARIMA on invocation counts; requires statsmodels."""
+    """Fixed-order ARIMA on invocation counts; requires statsmodels."""
 
     def __init__(self, order: tuple[int, int, int] = (2, 1, 2)) -> None:
         self.order = order
@@ -189,6 +189,59 @@ class ARIMAForecaster:
         if self._fitted is None:
             raise RuntimeError("call fit() before predict()")
         fc = self._fitted.forecast(steps=horizon)
+        return np.clip(np.asarray(fc, dtype=float), 0, None)
+
+
+@register_forecaster
+class AutoARIMAForecaster:
+    """Auto-selected ARIMA (p,d,q) via pmdarima; for holdout evaluation."""
+
+    def __init__(
+        self,
+        max_p: int = 5,
+        max_d: int = 2,
+        max_q: int = 5,
+        seasonal: bool = False,
+        **auto_arima_kwargs,
+    ) -> None:
+        self.max_p = max_p
+        self.max_d = max_d
+        self.max_q = max_q
+        self.seasonal = seasonal
+        self.auto_arima_kwargs = auto_arima_kwargs
+        self._model = None
+        self._order: tuple[int, int, int] | None = None
+
+    @property
+    def name(self) -> str:
+        if self._order is None:
+            return "auto_arima"
+        p, d, q = self._order
+        return f"auto_arima_{p}_{d}_{q}"
+
+    def fit(self, y: pd.Series) -> None:
+        from pmdarima import auto_arima
+
+        if len(y) < 20:
+            raise ValueError("train series too short for auto_arima")
+
+        self._model = auto_arima(
+            y.astype(float).values,
+            max_p=self.max_p,
+            max_d=self.max_d,
+            max_q=self.max_q,
+            seasonal=self.seasonal,
+            stepwise=True,
+            suppress_warnings=True,
+            error_action="ignore",
+            **self.auto_arima_kwargs,
+        )
+        self._order = tuple(self._model.order)
+
+    def predict(self, horizon: int) -> np.ndarray:
+        if self._model is None:
+            raise RuntimeError("call fit() before predict()")
+        fc = self._model.predict(n_periods=horizon)
         return np.clip(np.asarray(fc, dtype=float), 0, None)
 
 
@@ -240,22 +293,102 @@ class ProphetForecaster:
         return np.clip(yhat, 0, None)
 
 
-def mae(y_true: np.ndarray | pd.Series, y_pred: np.ndarray | pd.Series) -> float:
+def _mae(y_true: np.ndarray | pd.Series, y_pred: np.ndarray | pd.Series) -> float:
     yt = np.asarray(y_true, dtype=float)
     yp = np.asarray(y_pred, dtype=float)
     return float(np.mean(np.abs(yt - yp)))
 
 
-def rmse(y_true: np.ndarray | pd.Series, y_pred: np.ndarray | pd.Series) -> float:
+def _rmse(y_true: np.ndarray | pd.Series, y_pred: np.ndarray | pd.Series) -> float:
     yt = np.asarray(y_true, dtype=float)
     yp = np.asarray(y_pred, dtype=float)
     return float(np.sqrt(np.mean((yt - yp) ** 2)))
+
+
+def _effective_season_length(y: pd.Series, season_length: int) -> int:
+    """Use seasonal scaling only when the train window is long enough."""
+    n = len(y)
+    if n <= 1:
+        return 1
+    if n > season_length:
+        return season_length
+    return 1
+
+
+def _safe_nanmean(values: list[float]) -> float:
+    """Mean ignoring NaNs; no warning when every value is NaN."""
+    if not values:
+        return float("nan")
+    arr = np.asarray(values, dtype=float)
+    if np.all(np.isnan(arr)):
+        return float("nan")
+    with np.errstate(invalid="ignore"):
+        return float(np.nanmean(arr))
+
+
+def _in_sample_naive_scale_abs(y: pd.Series, season_length: int = 1) -> float:
+    """Mean absolute in-sample error of seasonal naive (MASE denominator)."""
+    m = _effective_season_length(y, season_length)
+    yt = np.asarray(y, dtype=float)
+    if len(yt) <= m:
+        return float("nan")
+    diffs = np.abs(yt[m:] - yt[:-m])
+    scale = float(np.mean(diffs))
+    return scale if scale > 0 else float("nan")
+
+
+def _in_sample_naive_scale_sq(y: pd.Series, season_length: int = 1) -> float:
+    """Mean squared in-sample error of seasonal naive (RMSSE denominator)."""
+    m = _effective_season_length(y, season_length)
+    yt = np.asarray(y, dtype=float)
+    if len(yt) <= m:
+        return float("nan")
+    diffs = yt[m:] - yt[:-m]
+    scale = float(np.mean(diffs**2))
+    return scale if scale > 0 else float("nan")
+
+
+def mase(
+    y_true: np.ndarray | pd.Series,
+    y_pred: np.ndarray | pd.Series,
+    y_train: pd.Series,
+    season_length: int = 1,
+) -> float:
+    """
+    Mean Absolute Scaled Error.
+
+    Scaled by in-sample MAE of a seasonal naive forecast on y_train
+    (Hyndman & Koehler, 2006). Values < 1 beat the naive benchmark.
+    """
+    scale = _in_sample_naive_scale_abs(y_train, season_length)
+    if np.isnan(scale):
+        return float("nan")
+    return _mae(y_true, y_pred) / scale
+
+
+def rmsse(
+    y_true: np.ndarray | pd.Series,
+    y_pred: np.ndarray | pd.Series,
+    y_train: pd.Series,
+    season_length: int = 1,
+) -> float:
+    """
+    Root Mean Squared Scaled Error.
+
+    Scaled by in-sample RMSE of a seasonal naive forecast on y_train
+    (M4/M5 convention). Values < 1 beat the naive benchmark.
+    """
+    scale = _in_sample_naive_scale_sq(y_train, season_length)
+    if np.isnan(scale):
+        return float("nan")
+    return _rmse(y_true, y_pred) / np.sqrt(scale)
 
 
 def evaluate_series(
     y_train: pd.Series,
     y_test: pd.Series,
     forecaster: Forecaster,
+    season_length: int = 1,
 ) -> dict:
     model = forecaster
     model.fit(y_train)
@@ -264,8 +397,8 @@ def evaluate_series(
         "model": model.name,
         "n_train": len(y_train),
         "n_test": len(y_test),
-        "mae": mae(y_test, y_pred),
-        "rmse": rmse(y_test, y_pred),
+        "mase": mase(y_test, y_pred, y_train, season_length),
+        "rmsse": rmsse(y_test, y_pred, y_train, season_length),
         "y_pred": y_pred,
     }
 
@@ -306,6 +439,7 @@ def evaluate_trace(
         selected = dict(top)
 
     rows: list[dict] = []
+    season_length = _default_season_length(freq)
     for (app, func), series in selected.items():
         split = temporal_split(
             series,
@@ -318,7 +452,12 @@ def evaluate_trace(
 
         for forecaster in forecasters:
             try:
-                result = evaluate_series(split.train, split.test, forecaster)
+                result = evaluate_series(
+                    split.train,
+                    split.test,
+                    forecaster,
+                    season_length=season_length,
+                )
             except Exception as exc:
                 print(f"skip {app[:8]}…/{func[:8]}… {forecaster.name}: {exc}")
                 continue
@@ -330,8 +469,144 @@ def evaluate_trace(
                     "freq": freq,
                     "n_train": result["n_train"],
                     "n_test": result["n_test"],
-                    "mae": result["mae"],
-                    "rmse": result["rmse"],
+                    "mase": result["mase"],
+                    "rmsse": result["rmsse"],
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def cv_origins(
+    n: int,
+    h: int,
+    min_train: int,
+    step: int | None = None,
+    max_folds: int | None = None,
+) -> list[int]:
+    """
+    Rolling-origin cut points for h-step-ahead CV.
+
+    Each origin t trains on y[:t] and evaluates on y[t:t+h].
+    When max_folds is set, origins are subsampled evenly across the series.
+    """
+    if n < min_train + h:
+        return []
+    step = h if step is None else step
+    origins = list(range(min_train, n - h + 1, step))
+    if max_folds is not None and len(origins) > max_folds:
+        idx = np.linspace(0, len(origins) - 1, max_folds, dtype=int)
+        origins = [origins[i] for i in np.unique(idx)]
+    return origins
+
+
+def evaluate_series_cv(
+    y: pd.Series,
+    forecaster: Forecaster,
+    h: int,
+    min_train: int,
+    step: int | None = None,
+    season_length: int = 1,
+    max_folds: int | None = None,
+) -> dict:
+    """h-step-ahead rolling-origin CV for one series and forecaster."""
+    origins = cv_origins(len(y), h, min_train, step, max_folds)
+    if not origins:
+        raise ValueError("series too short for CV")
+
+    mases: list[float] = []
+    rmsses: list[float] = []
+    for origin in origins:
+        train = y.iloc[:origin]
+        test = y.iloc[origin : origin + h]
+        forecaster.fit(train)
+        y_pred = forecaster.predict(h)
+        mases.append(mase(test, y_pred, train, season_length))
+        rmsses.append(rmsse(test, y_pred, train, season_length))
+
+    return {
+        "model": forecaster.name,
+        "h": h,
+        "n_folds": len(origins),
+        "n_valid_folds": int(np.sum(np.isfinite(mases))),
+        "mase": _safe_nanmean(mases),
+        "rmsse": _safe_nanmean(rmsses),
+    }
+
+
+def evaluate_trace_cv(
+    df: pd.DataFrame,
+    forecasters: list[Forecaster],
+    h: int = 10,
+    freq: str = "5min",
+    origin: str = "2021-01-31",
+    min_invocations: int = 50,
+    min_train: int = 48,
+    step: int | None = None,
+    max_folds: int = 10,
+    keys: list[tuple[str, str]] | None = None,
+    max_functions: int | None = None,
+) -> pd.DataFrame:
+    """
+    h-step-ahead rolling-origin CV on trace data.
+
+    One result row per (app, func, model) with mean MASE/RMSSE across folds.
+    Default max_folds=10 subsamples origins evenly across the trace.
+    """
+    all_series = build_invocation_series(
+        df,
+        freq=freq,
+        origin=origin,
+        min_invocations=min_invocations,
+    )
+
+    if keys is not None:
+        selected = {k: all_series[k] for k in keys if k in all_series}
+    else:
+        selected = all_series
+
+    if max_functions is not None and len(selected) > max_functions:
+        top = sorted(
+            selected.items(),
+            key=lambda kv: kv[1].sum(),
+            reverse=True,
+        )[:max_functions]
+        selected = dict(top)
+
+    step = h if step is None else step
+    season_length = _default_season_length(freq)
+    rows: list[dict] = []
+
+    for (app, func), series in selected.items():
+        if len(series) < min_train + h:
+            continue
+
+        for forecaster in forecasters:
+            try:
+                result = evaluate_series_cv(
+                    series,
+                    forecaster,
+                    h=h,
+                    min_train=min_train,
+                    step=step,
+                    season_length=season_length,
+                    max_folds=max_folds,
+                )
+            except Exception as exc:
+                print(f"skip {app[:8]}…/{func[:8]}… {forecaster.name}: {exc}")
+                continue
+            rows.append(
+                {
+                    "app": app,
+                    "func": func,
+                    "model": result["model"],
+                    "freq": freq,
+                    "h": h,
+                    "step": step,
+                    "n_folds": result["n_folds"],
+                    "n_valid_folds": result["n_valid_folds"],
+                    "mase": result["mase"],
+                    "rmsse": result["rmsse"],
                 }
             )
 
@@ -339,20 +614,23 @@ def evaluate_trace(
 
 
 def summarize_results(results: pd.DataFrame) -> pd.DataFrame:
-    """Mean and median MAE/RMSE per model."""
+    """Mean and median MASE/RMSSE per model."""
     if results.empty:
         return results
-    agg = results.groupby("model", as_index=False).agg(
-        mae_mean=("mae", "mean"),
-        mae_median=("mae", "median"),
-        rmse_mean=("rmse", "mean"),
-        rmse_median=("rmse", "median"),
+    agg_kwargs = dict(
+        mase_mean=("mase", "mean"),
+        mase_median=("mase", "median"),
+        rmsse_mean=("rmsse", "mean"),
+        rmsse_median=("rmsse", "median"),
         n_functions=("func", "count"),
     )
-    return agg.sort_values("mae_mean")
+    if "n_folds" in results.columns:
+        agg_kwargs["n_folds_mean"] = ("n_folds", "mean")
+    agg = results.groupby("model", as_index=False).agg(**agg_kwargs)
+    return agg.sort_values("mase_mean")
 
 
-def rank_models_per_function(results: pd.DataFrame, metric: str = "mae") -> pd.DataFrame:
+def rank_models_per_function(results: pd.DataFrame, metric: str = "mase") -> pd.DataFrame:
     """Rank models within each function by metric (1 = best)."""
     if results.empty:
         return results
@@ -397,10 +675,30 @@ def default_forecasters(
     include_prophet: bool = True,
     arima_order: tuple[int, int, int] = (2, 1, 2),
 ) -> list[Forecaster]:
-    """Baselines plus ARIMA and Prophet (new instance per model type)."""
+    """Baselines plus fixed-order ARIMA and Prophet (used by CV)."""
     models: list[Forecaster] = default_baselines(freq)
     if include_arima:
         models.append(ARIMAForecaster(order=arima_order))
+    if include_prophet:
+        models.append(ProphetForecaster(freq=freq))
+    return models
+
+
+def default_holdout_forecasters(
+    freq: str = "5min",
+    *,
+    include_auto_arima: bool = True,
+    include_prophet: bool = True,
+    max_p: int = 5,
+    max_d: int = 2,
+    max_q: int = 5,
+) -> list[Forecaster]:
+    """Baselines plus pmdarima auto-ARIMA and Prophet (for holdout eval)."""
+    models: list[Forecaster] = default_baselines(freq)
+    if include_auto_arima:
+        models.append(
+            AutoARIMAForecaster(max_p=max_p, max_d=max_d, max_q=max_q)
+        )
     if include_prophet:
         models.append(ProphetForecaster(freq=freq))
     return models
