@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
 import argparse
 import time
 from pathlib import Path
