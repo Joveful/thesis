@@ -71,6 +71,35 @@ def build_invocation_series(
     return series_by_key
 
 
+def build_total_invocation_series(
+    df: pd.DataFrame,
+    freq: str = "5min",
+    origin: str = "2021-01-31",
+    timestamp_col: str = "start_timestamp",
+) -> pd.Series:
+    """Aggregate every invocation into one platform-wide count time series."""
+    work = df.copy()
+    if timestamp_col not in work.columns:
+        if "end_timestamp" in work.columns and "duration" in work.columns:
+            work[timestamp_col] = work["end_timestamp"] - work["duration"]
+        else:
+            raise ValueError(
+                f"Missing {timestamp_col!r}; need start_timestamp or end_timestamp+duration"
+            )
+
+    work["datetime"] = pd.to_datetime(work[timestamp_col], origin=origin, unit="s")
+    work = work.sort_values("datetime")
+    ts = (
+        work.set_index("datetime")
+        .resample(freq)
+        .size()
+        .asfreq(freq, fill_value=0)
+        .sort_index()
+    )
+    ts.name = "count"
+    return ts
+
+
 def temporal_split(
     series: pd.Series,
     test_fraction: float = 0.2,
@@ -101,12 +130,12 @@ class Forecaster(Protocol):
     def predict(self, horizon: int) -> np.ndarray: ...
 
 
-def _default_season_length(freq: str) -> int:
-    """Buckets per day for common pandas offset strings."""
+def _default_season_length(freq: str, days: int = 1) -> int:
+    """Buckets per `days`-day season for common pandas offset strings."""
     td = pd.Timedelta(freq)
     if td <= pd.Timedelta(0):
-        return 24
-    return max(1, int(pd.Timedelta("1D") / td))
+        return 24 * days
+    return max(1, int(pd.Timedelta(f"{days}D") / td))
 
 
 @register_forecaster
@@ -148,21 +177,113 @@ class SeasonalNaiveForecaster:
 
 
 @register_forecaster
-class MovingAverageForecaster:
-    def __init__(self, window: int = 12) -> None:
-        self.window = window
-        self._mean: float = 0.0
+class MA1Forecaster:
+    """Moving-average model of order 1 (MA(1) / ARIMA(0,0,1)); requires statsmodels."""
+
+    def __init__(self) -> None:
+        self._fitted = None
 
     @property
     def name(self) -> str:
-        return f"moving_average_w{self.window}"
+        return "ma1"
 
     def fit(self, y: pd.Series) -> None:
-        tail = y.iloc[-self.window :] if len(y) else y
-        self._mean = float(tail.mean()) if len(tail) else 0.0
+        from statsmodels.tsa.arima.model import ARIMA
+
+        if len(y) < 10:
+            raise ValueError("train series too short for MA(1)")
+        self._fitted = ARIMA(y.astype(float), order=(0, 0, 1)).fit()
 
     def predict(self, horizon: int) -> np.ndarray:
-        return np.clip(np.full(horizon, self._mean), 0, None)
+        if self._fitted is None:
+            raise RuntimeError("call fit() before predict()")
+        fc = self._fitted.forecast(steps=horizon)
+        return np.clip(np.asarray(fc, dtype=float), 0, None)
+
+
+@register_forecaster
+class AR1Forecaster:
+    """Autoregressive model of order 1 (AR(1)); requires statsmodels."""
+
+    def __init__(self) -> None:
+        self._fitted = None
+
+    @property
+    def name(self) -> str:
+        return "ar1"
+
+    def fit(self, y: pd.Series) -> None:
+        from statsmodels.tsa.ar_model import AutoReg
+
+        if len(y) < 10:
+            raise ValueError("train series too short for AR(1)")
+        self._fitted = AutoReg(y.astype(float), lags=1, old_names=False).fit()
+
+    def predict(self, horizon: int) -> np.ndarray:
+        if self._fitted is None:
+            raise RuntimeError("call fit() before predict()")
+        fc = self._fitted.forecast(steps=horizon)
+        return np.clip(np.asarray(fc, dtype=float), 0, None)
+
+
+@register_forecaster
+class SESForecaster:
+    """Simple exponential smoothing (level only); requires statsmodels."""
+
+    def __init__(self) -> None:
+        self._fitted = None
+
+    @property
+    def name(self) -> str:
+        return "ses"
+
+    def fit(self, y: pd.Series) -> None:
+        from statsmodels.tsa.holtwinters import ExponentialSmoothing
+
+        if len(y) < 10:
+            raise ValueError("train series too short for SES")
+        self._fitted = ExponentialSmoothing(
+            y.astype(float),
+            trend=None,
+            seasonal=None,
+            initialization_method="estimated",
+        ).fit(optimized=True)
+
+    def predict(self, horizon: int) -> np.ndarray:
+        if self._fitted is None:
+            raise RuntimeError("call fit() before predict()")
+        fc = self._fitted.forecast(horizon)
+        return np.clip(np.asarray(fc, dtype=float), 0, None)
+
+
+@register_forecaster
+class DESForecaster:
+    """Double exponential smoothing (Holt linear trend); requires statsmodels."""
+
+    def __init__(self) -> None:
+        self._fitted = None
+
+    @property
+    def name(self) -> str:
+        return "des"
+
+    def fit(self, y: pd.Series) -> None:
+        from statsmodels.tsa.holtwinters import ExponentialSmoothing
+
+        if len(y) < 10:
+            raise ValueError("train series too short for DES")
+        self._fitted = ExponentialSmoothing(
+            y.astype(float),
+            trend="add",
+            seasonal=None,
+            initialization_method="estimated",
+        ).fit(optimized=True)
+
+    def predict(self, horizon: int) -> np.ndarray:
+        if self._fitted is None:
+            raise RuntimeError("call fit() before predict()")
+        fc = self._fitted.forecast(horizon)
+        return np.clip(np.asarray(fc, dtype=float), 0, None)
 
 
 @register_forecaster
@@ -245,6 +366,113 @@ class AutoARIMAForecaster:
         return np.clip(np.asarray(fc, dtype=float), 0, None)
 
 
+def _steps_per_resample(orig_freq: str, resample_freq: str) -> int:
+    """Buckets of orig_freq in one resample_freq bucket (e.g. 60 for 1min -> 1h)."""
+    return max(1, int(pd.Timedelta(resample_freq) / pd.Timedelta(orig_freq)))
+
+
+def _expand_resampled_forecast(
+    fc_resampled: np.ndarray, steps_per_bucket: int, horizon: int
+) -> np.ndarray:
+    """Split each coarse-bucket forecast evenly across fine-bucket steps."""
+    per_step = np.repeat(fc_resampled / steps_per_bucket, steps_per_bucket)
+    return per_step[:horizon]
+
+
+@register_forecaster
+class AutoSARIMAForecaster:
+    """
+    Auto-selected seasonal ARIMA via pmdarima (holdout evaluation).
+
+    Fitted on hourly counts with seasonal period m = season_days * 24 (default
+    one day); hourly forecasts are expanded back to the original bucket frequency.
+    """
+
+    def __init__(
+        self,
+        freq: str = "5min",
+        season_days: int = 1,
+        fit_freq: str = "1h",
+        max_p: int = 2,
+        max_d: int = 1,
+        max_q: int = 2,
+        max_P: int = 1,
+        max_D: int = 1,
+        max_Q: int = 1,
+        min_hourly_points: int | None = None,
+        **auto_arima_kwargs,
+    ) -> None:
+        self.freq = freq
+        self.season_days = season_days
+        self.fit_freq = fit_freq
+        self.max_p = max_p
+        self.max_d = max_d
+        self.max_q = max_q
+        self.max_P = max_P
+        self.max_D = max_D
+        self.max_Q = max_Q
+        self.auto_arima_kwargs = auto_arima_kwargs
+        self._seasonal_period = season_days * 24
+        self._steps_per_fit_bucket = _steps_per_resample(freq, fit_freq)
+        self._min_hourly_points = min_hourly_points or (self._seasonal_period + 20)
+        self._model = None
+        self._order: tuple[int, int, int] | None = None
+        self._seasonal_order: tuple[int, int, int, int] | None = None
+
+    @property
+    def name(self) -> str:
+        if self._order is None:
+            return "sarima"
+        p, d, q = self._order
+        P, D, Q, m = self._seasonal_order or (0, 0, 0, self._seasonal_period)
+        return f"sarima_{p}_{d}_{q}_{P}_{D}_{Q}_{m}"
+
+    def _hourly_train(self, y: pd.Series) -> pd.Series:
+        return y.resample(self.fit_freq).sum()
+
+    def fit(self, y: pd.Series) -> None:
+        from pmdarima import auto_arima
+
+        y_h = self._hourly_train(y.astype(float))
+        if len(y_h) < self._min_hourly_points:
+            raise ValueError(
+                f"train series too short for sarima "
+                f"(need {self._min_hourly_points} hourly points, got {len(y_h)})"
+            )
+
+        self._model = auto_arima(
+            y_h.values,
+            seasonal=True,
+            m=self._seasonal_period,
+            max_p=self.max_p,
+            max_d=self.max_d,
+            max_q=self.max_q,
+            max_P=self.max_P,
+            max_D=self.max_D,
+            max_Q=self.max_Q,
+            stepwise=True,
+            suppress_warnings=True,
+            error_action="ignore",
+            approximation=True,
+            **self.auto_arima_kwargs,
+        )
+        self._order = tuple(self._model.order)
+        self._seasonal_order = tuple(self._model.seasonal_order)
+
+    def predict(self, horizon: int) -> np.ndarray:
+        if self._model is None:
+            raise RuntimeError("call fit() before predict()")
+
+        steps = int(np.ceil(horizon / self._steps_per_fit_bucket))
+        fc_h = self._model.predict(n_periods=steps)
+        fc = _expand_resampled_forecast(
+            np.asarray(fc_h, dtype=float),
+            self._steps_per_fit_bucket,
+            horizon,
+        )
+        return np.clip(fc, 0, None)
+
+
 @register_forecaster
 class ProphetForecaster:
     """Prophet on invocation counts; requires prophet."""
@@ -276,6 +504,8 @@ class ProphetForecaster:
 
         dfp = pd.DataFrame({"ds": y.index, "y": y.astype(float).values})
         self._model = Prophet(
+            growth="flat",
+            seasonality_mode="multiplicative",
             daily_seasonality=self.daily_seasonality,
             weekly_seasonality=self.weekly_seasonality,
             yearly_seasonality=self.yearly_seasonality,
@@ -384,21 +614,33 @@ def rmsse(
     return _rmse(y_true, y_pred) / np.sqrt(scale)
 
 
+def _season_length_m7(freq: str, season_days: int = 7) -> int:
+    """Season length in buckets for m=7-day seasonal naive scaling."""
+    return _default_season_length(freq, days=season_days)
+
+
 def evaluate_series(
     y_train: pd.Series,
     y_test: pd.Series,
     forecaster: Forecaster,
-    season_length: int = 1,
+    *,
+    freq: str = "5min",
+    season_days: int = 7,
 ) -> dict:
     model = forecaster
     model.fit(y_train)
     y_pred = model.predict(len(y_test))
+    m7 = _season_length_m7(freq, season_days)
     return {
         "model": model.name,
         "n_train": len(y_train),
         "n_test": len(y_test),
-        "mase": mase(y_test, y_pred, y_train, season_length),
-        "rmsse": rmsse(y_test, y_pred, y_train, season_length),
+        "mae": _mae(y_test, y_pred),
+        "rmse": _rmse(y_test, y_pred),
+        "mase_m1": mase(y_test, y_pred, y_train, 1),
+        "rmsse_m1": rmsse(y_test, y_pred, y_train, 1),
+        "mase_m7": mase(y_test, y_pred, y_train, m7),
+        "rmsse_m7": rmsse(y_test, y_pred, y_train, m7),
         "y_pred": y_pred,
     }
 
@@ -414,6 +656,7 @@ def evaluate_trace(
     min_test_points: int = 12,
     keys: list[tuple[str, str]] | None = None,
     max_functions: int | None = None,
+    season_days: int = 1,
 ) -> pd.DataFrame:
     """
     Evaluate forecasters on trace data; one result row per (app, func, model).
@@ -439,7 +682,6 @@ def evaluate_trace(
         selected = dict(top)
 
     rows: list[dict] = []
-    season_length = _default_season_length(freq)
     for (app, func), series in selected.items():
         split = temporal_split(
             series,
@@ -456,7 +698,8 @@ def evaluate_trace(
                     split.train,
                     split.test,
                     forecaster,
-                    season_length=season_length,
+                    freq=freq,
+                    season_days=season_days,
                 )
             except Exception as exc:
                 print(f"skip {app[:8]}…/{func[:8]}… {forecaster.name}: {exc}")
@@ -469,12 +712,102 @@ def evaluate_trace(
                     "freq": freq,
                     "n_train": result["n_train"],
                     "n_test": result["n_test"],
-                    "mase": result["mase"],
-                    "rmsse": result["rmsse"],
+                    "mase_m1": result["mase_m1"],
+                    "rmsse_m1": result["rmsse_m1"],
+                    "mase_m7": result["mase_m7"],
+                    "rmsse_m7": result["rmsse_m7"],
                 }
             )
 
     return pd.DataFrame(rows)
+
+
+def evaluate_total_invocations(
+    df: pd.DataFrame,
+    forecasters: list[Forecaster],
+    freq: str = "5min",
+    origin: str = "2021-01-31",
+    test_fraction: float = 0.2,
+    min_train_points: int = 48,
+    min_test_points: int = 12,
+    season_days: int = 1,
+) -> pd.DataFrame:
+    """
+    Holdout evaluation on one series aggregating all function invocations.
+    """
+    series = build_total_invocation_series(df, freq=freq, origin=origin)
+    split = temporal_split(
+        series,
+        test_fraction=test_fraction,
+        min_train_points=min_train_points,
+        min_test_points=min_test_points,
+    )
+    if split is None:
+        return pd.DataFrame()
+
+    rows: list[dict] = []
+    for forecaster in forecasters:
+        try:
+            result = evaluate_series(
+                split.train,
+                split.test,
+                forecaster,
+                freq=freq,
+                season_days=season_days,
+            )
+        except Exception as exc:
+            print(f"skip {forecaster.name}: {exc}")
+            continue
+        rows.append(
+            {
+                "app": "all",
+                "func": "all",
+                "model": result["model"],
+                "freq": freq,
+                "n_train": result["n_train"],
+                "n_test": result["n_test"],
+                "mae": result["mae"],
+                "rmse": result["rmse"],
+                "mase_m1": result["mase_m1"],
+                "rmsse_m1": result["rmsse_m1"],
+                "mase_m7": result["mase_m7"],
+                "rmsse_m7": result["rmsse_m7"],
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def summarize_aggregate_results(
+    results: pd.DataFrame,
+    *,
+    group_auto_arima: bool = True,
+    sort_by: str = "mase_m7",
+) -> pd.DataFrame:
+    """Summary for all-invocation aggregate eval (MAE/RMSE + MASE/RMSSE at m=1 and m=7)."""
+    if results.empty:
+        return results
+    work = results.copy()
+    if group_auto_arima:
+        work["model"] = work["model"].map(_model_group)
+    metrics = [
+        c
+        for c in (
+            "mae",
+            "rmse",
+            "mase_m1",
+            "rmsse_m1",
+            "mase_m7",
+            "rmsse_m7",
+            "mase",
+            "rmsse",
+        )
+        if c in work.columns
+    ]
+    out = work.groupby("model", as_index=False)[metrics].mean()
+    if sort_by in out.columns:
+        return out.sort_values(sort_by)
+    return out
 
 
 def cv_origins(
@@ -613,24 +946,62 @@ def evaluate_trace_cv(
     return pd.DataFrame(rows)
 
 
-def summarize_results(results: pd.DataFrame) -> pd.DataFrame:
-    """Mean and median MASE/RMSSE per model."""
+def _model_group(model: str) -> str:
+    """Collapse auto-selected ARIMA/SARIMA parameter variants to group labels."""
+    if model == "auto_arima" or model.startswith("auto_arima_"):
+        return "auto_arima"
+    if model == "sarima" or model.startswith("sarima_"):
+        return "sarima"
+    if model == "seasonal_arima" or model.startswith("seasonal_arima_"):
+        return "sarima"
+    return model
+
+
+def _scaled_metric_agg_kwargs(col: str) -> dict:
+    """Aggregation kwargs for one scaled metric column (mean, median, std)."""
+    return {
+        f"{col}_mean": (col, "mean"),
+        f"{col}_median": (col, "median"),
+        f"{col}_std": (col, "std"),
+    }
+
+
+def summarize_results(
+    results: pd.DataFrame,
+    *,
+    group_auto_arima: bool = True,
+    sort_by: str = "mase_m7_mean",
+) -> pd.DataFrame:
+    """Mean, median, and std of MASE/RMSSE per model (m=1 and m=7-day scaling)."""
     if results.empty:
         return results
-    agg_kwargs = dict(
-        mase_mean=("mase", "mean"),
-        mase_median=("mase", "median"),
-        rmsse_mean=("rmsse", "mean"),
-        rmsse_median=("rmsse", "median"),
-        n_functions=("func", "count"),
-    )
-    if "n_folds" in results.columns:
+    work = results.copy()
+    if group_auto_arima:
+        work["model"] = work["model"].map(_model_group)
+    agg_kwargs: dict = {}
+    if "mase_m1" in work.columns:
+        for col in ("mase_m1", "rmsse_m1", "mase_m7", "rmsse_m7"):
+            if col in work.columns:
+                agg_kwargs.update(_scaled_metric_agg_kwargs(col))
+    elif "mase" in work.columns:
+        agg_kwargs.update(_scaled_metric_agg_kwargs("mase"))
+        agg_kwargs.update(_scaled_metric_agg_kwargs("rmsse"))
+    agg_kwargs["n_functions"] = ("func", "count")
+    if "n_folds" in work.columns:
         agg_kwargs["n_folds_mean"] = ("n_folds", "mean")
-    agg = results.groupby("model", as_index=False).agg(**agg_kwargs)
-    return agg.sort_values("mase_mean")
+    if "n_valid_folds" in work.columns:
+        agg_kwargs["n_valid_folds_mean"] = ("n_valid_folds", "mean")
+    agg = work.groupby("model", as_index=False).agg(**agg_kwargs)
+    if sort_by in agg.columns:
+        return agg.sort_values(sort_by)
+    elif "mase_m7_mean" in agg.columns:
+        return agg.sort_values("mase_m7_mean")
+    elif "mase_mean" in agg.columns:
+        return agg.sort_values("mase_mean")
+    return agg
 
 
-def rank_models_per_function(results: pd.DataFrame, metric: str = "mase") -> pd.DataFrame:
+def rank_models_per_function(results: pd.DataFrame, metric: str = "mase_m7") -> pd.DataFrame:
     """Rank models within each function by metric (1 = best)."""
     if results.empty:
         return results
@@ -659,12 +1030,15 @@ def plot_holdout(
     return ax
 
 
-def default_baselines(freq: str = "5min") -> list[Forecaster]:
+def default_baselines(freq: str = "5min", season_days: int = 1) -> list[Forecaster]:
     """Standard baseline forecasters for experiments."""
     return [
         NaiveForecaster(),
-        SeasonalNaiveForecaster(freq=freq),
-        MovingAverageForecaster(window=12),
+        SeasonalNaiveForecaster(
+            freq=freq,
+            season_length=_default_season_length(freq, days=season_days),
+        ),
+        MA1Forecaster(),
     ]
 
 
@@ -687,17 +1061,31 @@ def default_forecasters(
 def default_holdout_forecasters(
     freq: str = "5min",
     *,
+    season_days: int = 7,
+    sarima_season_days: int = 1,
     include_auto_arima: bool = True,
+    include_seasonal_arima: bool = True,
     include_prophet: bool = True,
     max_p: int = 5,
     max_d: int = 2,
     max_q: int = 5,
 ) -> list[Forecaster]:
-    """Baselines plus pmdarima auto-ARIMA and Prophet (for holdout eval)."""
-    models: list[Forecaster] = default_baselines(freq)
+    """Baselines plus holdout-only models (AR1, SES, DES, auto-ARIMA, SARIMA, Prophet)."""
+    models: list[Forecaster] = default_baselines(freq, season_days=season_days)
+    models.extend(
+        [
+            AR1Forecaster(),
+            SESForecaster(),
+            DESForecaster(),
+        ]
+    )
     if include_auto_arima:
         models.append(
             AutoARIMAForecaster(max_p=max_p, max_d=max_d, max_q=max_q)
+        )
+    if include_seasonal_arima:
+        models.append(
+            AutoSARIMAForecaster(freq=freq, season_days=sarima_season_days)
         )
     if include_prophet:
         models.append(ProphetForecaster(freq=freq))
