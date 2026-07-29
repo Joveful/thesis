@@ -16,6 +16,7 @@ for _var in (
     os.environ.setdefault(_var, "1")
 
 import argparse
+import csv
 import gc
 import re
 import time
@@ -35,6 +36,22 @@ def _log_phase(message: str) -> None:
     print(f"[{elapsed:6.1f}s] {message}", flush=True)
 
 
+def _warn_numpy_pandas_compat() -> None:
+    """Pandas 2.3+ against numpy 1.24 is a known segfault combo in read_csv/merge."""
+    np_parts = [int(x) for x in np.__version__.split(".")[:2]]
+    pd_parts = [int(x) for x in pd.__version__.split(".")[:2]]
+    if tuple(pd_parts) >= (2, 3) and tuple(np_parts) < (1, 26):
+        print(
+            f"WARNING: pandas {pd.__version__} with numpy {np.__version__} is "
+            "unsupported and often segfaults in pd.read_csv. Preload defaults "
+            "to stdlib csv; upgrade numpy to >=1.26 on the test machine if you "
+            "want the pandas preload engine.",
+            flush=True,
+        )
+
+
+_warn_numpy_pandas_compat()
+
 _log_phase("importing forecast_eval")
 from forecast_eval import (
     build_minute_bin_function_metadata,
@@ -52,72 +69,91 @@ TRACE_START = pd.Timestamp("2019-07-15", tz="UTC")
 TRACE_DAYS = 14
 MINUTE_COLS = [str(m) for m in range(1, 1441)]
 DAY_CSV_USECOLS = ["HashApp", "HashFunction", *MINUTE_COLS]
-
-
-def load_function_invocations(
-    app: str,
-    func: str,
-    *,
-    data_dir: Path = DEFAULT_DATA,
-) -> pd.DataFrame:
-    """Per-minute invocation counts for one function across all days."""
-    frames: list[pd.DataFrame] = []
-    for path in sorted(data_dir.glob("invocations_per_function*.csv")):
-        day = int(re.search(r"\.d(\d+)\.csv$", path.name).group(1))
-        day_df = pd.read_csv(path, usecols=DAY_CSV_USECOLS)
-        mask = (day_df["HashApp"] == app) & (day_df["HashFunction"] == func)
-        rows = day_df.loc[mask, MINUTE_COLS]
-        if rows.empty:
-            continue
-        long = rows.melt(var_name="minute", value_name="count")
-        long["minute"] = long["minute"].astype(int)
-        long["timestamp"] = (
-            TRACE_START
-            + pd.Timedelta(days=day - 1)
-            + pd.to_timedelta(long["minute"] - 1, unit="m")
-        )
-        frames.append(long[["timestamp", "count"]])
-
-    if not frames:
-        raise ValueError(f"No rows found for app={app!r}, func={func!r}")
-
-    return (
-        pd.concat(frames, ignore_index=True)
-        .sort_values("timestamp")
-        .reset_index(drop=True)
-    )
-
-
-DAY_CSV_USECOLS = ["HashApp", "HashFunction", *MINUTE_COLS]
 MINUTE_DTYPES = {col: np.int32 for col in MINUTE_COLS}
 
 
-def preload_function_minute_series(
+def _day_from_path(path: Path) -> int:
+    return int(re.search(r"\.d(\d+)\.csv$", path.name).group(1))
+
+
+def _preload_init_buffers(
+    eval_keys: list[tuple[str, str]],
+    freq: str,
+) -> tuple[dict[tuple[str, str], int], np.ndarray, pd.DatetimeIndex]:
+    n_minutes = TRACE_DAYS * 1440
+    return (
+        {key: idx for idx, key in enumerate(eval_keys)},
+        np.zeros((len(eval_keys), n_minutes), dtype=np.int32),
+        trace_minutes(freq),
+    )
+
+
+def _accumulate_day_row(
+    row: dict[str, str],
+    *,
+    key_to_idx: dict[tuple[str, str], int],
+    accum: np.ndarray,
+    day_start: int,
+) -> None:
+    idx = key_to_idx.get((row["HashApp"], row["HashFunction"]))
+    if idx is None:
+        return
+    day_counts = np.fromiter(
+        (int(row[col] or 0) for col in MINUTE_COLS),
+        dtype=np.int32,
+        count=len(MINUTE_COLS),
+    )
+    accum[idx, day_start : day_start + 1440] += day_counts
+
+
+def _preload_function_minute_series_csv(
+    eval_keys: list[tuple[str, str]],
+    data_dir: Path,
+    *,
+    freq: str = "1min",
+) -> dict[tuple[str, str], pd.Series]:
+    """Stream daily CSVs with stdlib csv (no pd.read_csv)."""
+    if not eval_keys:
+        return {}
+
+    key_to_idx, accum, minutes = _preload_init_buffers(eval_keys, freq)
+
+    for path in sorted(data_dir.glob("invocations_per_function*.csv")):
+        day_start = (_day_from_path(path) - 1) * 1440
+        _log_phase(f"preload {path.name} ({len(eval_keys)} eval functions, csv)")
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                _accumulate_day_row(
+                    row,
+                    key_to_idx=key_to_idx,
+                    accum=accum,
+                    day_start=day_start,
+                )
+
+    return {
+        key: pd.Series(accum[idx], index=minutes, dtype=int)
+        for key, idx in key_to_idx.items()
+    }
+
+
+def _preload_function_minute_series_pandas(
     eval_keys: list[tuple[str, str]],
     data_dir: Path,
     *,
     freq: str = "1min",
     chunk_size: int = 2000,
 ) -> dict[tuple[str, str], pd.Series]:
-    """
-    Load 1-minute series for all evaluation functions in one pass per daily CSV.
-
-    Uses chunked reads and in-place numpy buffers (no melt/concat) to keep peak
-    memory flat across large day files such as d12.
-    """
+    """Chunked pandas preload (fast locally; can segfault on old numpy builds)."""
     if not eval_keys:
         return {}
 
-    n_minutes = TRACE_DAYS * 1440
-    minutes = trace_minutes(freq)
-    key_to_idx = {key: idx for idx, key in enumerate(eval_keys)}
-    accum = np.zeros((len(eval_keys), n_minutes), dtype=np.int32)
+    key_to_idx, accum, minutes = _preload_init_buffers(eval_keys, freq)
     keys_df = pd.DataFrame(eval_keys, columns=["HashApp", "HashFunction"])
 
     for path in sorted(data_dir.glob("invocations_per_function*.csv")):
-        day = int(re.search(r"\.d(\d+)\.csv$", path.name).group(1))
-        day_start = (day - 1) * 1440
-        _log_phase(f"preload {path.name} ({len(eval_keys)} eval functions)")
+        day_start = (_day_from_path(path) - 1) * 1440
+        _log_phase(f"preload {path.name} ({len(eval_keys)} eval functions, pandas)")
         for chunk in pd.read_csv(
             path,
             usecols=DAY_CSV_USECOLS,
@@ -147,6 +183,57 @@ def preload_function_minute_series(
         key: pd.Series(accum[idx], index=minutes, dtype=int)
         for key, idx in key_to_idx.items()
     }
+
+
+def preload_function_minute_series(
+    eval_keys: list[tuple[str, str]],
+    data_dir: Path,
+    *,
+    freq: str = "1min",
+    chunk_size: int = 2000,
+    engine: str = "csv",
+) -> dict[tuple[str, str], pd.Series]:
+    if engine == "pandas":
+        return _preload_function_minute_series_pandas(
+            eval_keys, data_dir, freq=freq, chunk_size=chunk_size
+        )
+    if engine != "csv":
+        raise ValueError(f"unknown preload engine {engine!r}; use 'csv' or 'pandas'")
+    return _preload_function_minute_series_csv(eval_keys, data_dir, freq=freq)
+
+
+def load_function_invocations(
+    app: str,
+    func: str,
+    *,
+    data_dir: Path = DEFAULT_DATA,
+) -> pd.DataFrame:
+    """Per-minute invocation counts for one function across all days."""
+    frames: list[pd.DataFrame] = []
+    for path in sorted(data_dir.glob("invocations_per_function*.csv")):
+        day = _day_from_path(path)
+        day_df = pd.read_csv(path, usecols=DAY_CSV_USECOLS)
+        mask = (day_df["HashApp"] == app) & (day_df["HashFunction"] == func)
+        rows = day_df.loc[mask, MINUTE_COLS]
+        if rows.empty:
+            continue
+        long = rows.melt(var_name="minute", value_name="count")
+        long["minute"] = long["minute"].astype(int)
+        long["timestamp"] = (
+            TRACE_START
+            + pd.Timedelta(days=day - 1)
+            + pd.to_timedelta(long["minute"] - 1, unit="m")
+        )
+        frames.append(long[["timestamp", "count"]])
+
+    if not frames:
+        raise ValueError(f"No rows found for app={app!r}, func={func!r}")
+
+    return (
+        pd.concat(frames, ignore_index=True)
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
 
 
 def trace_minutes(freq: str = "1min") -> pd.DatetimeIndex:
@@ -230,6 +317,7 @@ def run_sample_holdout(
     include_auto_arima: bool,
     verbose: bool,
     preload_chunk_size: int,
+    preload_engine: str,
 ) -> pd.DataFrame:
     if not eval_keys:
         return pd.DataFrame()
@@ -247,7 +335,11 @@ def run_sample_holdout(
 
     _log_phase(f"preloading minute series for {len(eval_keys)} functions")
     series_by_key = preload_function_minute_series(
-        eval_keys, data_dir, freq=freq, chunk_size=preload_chunk_size
+        eval_keys,
+        data_dir,
+        freq=freq,
+        chunk_size=preload_chunk_size,
+        engine=preload_engine,
     )
     _log_phase(f"preloaded {len(series_by_key)} series")
 
@@ -455,6 +547,12 @@ def parse_args() -> argparse.Namespace:
         help="Print each (function, model) fit (helps locate native crashes)",
     )
     parser.add_argument(
+        "--preload-engine",
+        choices=("csv", "pandas"),
+        default="csv",
+        help="How to read daily CSVs during preload (csv avoids pd.read_csv segfaults)",
+    )
+    parser.add_argument(
         "--preload-chunk-size",
         type=int,
         default=2000,
@@ -519,6 +617,7 @@ def main() -> None:
         include_auto_arima=include_auto_arima,
         verbose=args.verbose,
         preload_chunk_size=args.preload_chunk_size,
+        preload_engine=args.preload_engine,
     )
 
     print("\n## Per-function holdout — macro (each function counts equally)")
