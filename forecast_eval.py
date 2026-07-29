@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, TypeVar
+from typing import TYPE_CHECKING, Callable, Protocol, TypeVar
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
+if TYPE_CHECKING:
+    import matplotlib.pyplot as plt
 
 ForecasterT = TypeVar("ForecasterT", bound="Forecaster")
 
@@ -1036,9 +1038,11 @@ def plot_holdout(
     split: EvalSplit,
     y_pred: np.ndarray,
     title: str = "Invocation forecast holdout",
-    ax: plt.Axes | None = None,
-) -> plt.Axes:
+    ax: "plt.Axes | None" = None,
+) -> "plt.Axes":
     """Plot train history, test actuals, and holdout predictions."""
+    import matplotlib.pyplot as plt
+
     if ax is None:
         _, ax = plt.subplots(figsize=(12, 4))
 
@@ -1202,6 +1206,7 @@ def build_minute_bin_function_metadata(
     trace_minutes: int = 14 * 1440,
     n_volume_bins: int = 5,
     n_activity_bins: int = 3,
+    log: Callable[[str], None] | None = None,
 ) -> pd.DataFrame:
     """
     Build per-function metadata from Azure 2019-style minute-count CSVs.
@@ -1216,11 +1221,12 @@ def build_minute_bin_function_metadata(
     triggers: dict[tuple[str, str], str] = {}
 
     for path in sorted(data_dir.glob("invocations_per_function*.csv")):
+        if log is not None:
+            log(f"metadata scan {path.name}")
         day_df = pd.read_csv(path, usecols=usecols)
-        minute_totals = day_df[minute_cols].sum(axis=1).astype(np.int64)
-        active_minutes = (day_df[minute_cols].to_numpy(dtype=np.int32) > 0).sum(
-            axis=1
-        )
+        minute_frame = day_df[minute_cols]
+        minute_totals = minute_frame.sum(axis=1).astype(np.int64)
+        active_minutes = (minute_frame > 0).sum(axis=1).astype(np.int64)
         for app, func, trigger, total, active_count in zip(
             day_df[app_col],
             day_df[func_col],

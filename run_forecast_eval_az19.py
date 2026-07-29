@@ -3,8 +3,17 @@
 
 from __future__ import annotations
 
-import warnings
-warnings.simplefilter(action='ignore', category=FutureWarning)
+import os
+
+# Limit native BLAS/OpenMP threads; oversubscription can segfault on some Linux hosts.
+for _var in (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(_var, "1")
 
 import argparse
 import re
@@ -16,6 +25,15 @@ import pandas as pd
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
+_T0 = time.perf_counter()
+
+
+def _log_phase(message: str) -> None:
+    elapsed = time.perf_counter() - _T0
+    print(f"[{elapsed:6.1f}s] {message}", flush=True)
+
+
+_log_phase("importing forecast_eval")
 from forecast_eval import (
     build_minute_bin_function_metadata,
     default_holdout_forecasters,
@@ -31,6 +49,7 @@ DEFAULT_DATA = Path("data/azure2019")
 TRACE_START = pd.Timestamp("2019-07-15", tz="UTC")
 TRACE_DAYS = 14
 MINUTE_COLS = [str(m) for m in range(1, 1441)]
+DAY_CSV_USECOLS = ["HashApp", "HashFunction", *MINUTE_COLS]
 
 
 def load_function_invocations(
@@ -43,9 +62,9 @@ def load_function_invocations(
     frames: list[pd.DataFrame] = []
     for path in sorted(data_dir.glob("invocations_per_function*.csv")):
         day = int(re.search(r"\.d(\d+)\.csv$", path.name).group(1))
-        day_df = pd.read_csv(path)
+        day_df = pd.read_csv(path, usecols=DAY_CSV_USECOLS)
         mask = (day_df["HashApp"] == app) & (day_df["HashFunction"] == func)
-        rows = day_df.loc[mask, [str(m) for m in range(1, 1441)]]
+        rows = day_df.loc[mask, MINUTE_COLS]
         if rows.empty:
             continue
         long = rows.melt(var_name="minute", value_name="count")
@@ -65,6 +84,59 @@ def load_function_invocations(
         .sort_values("timestamp")
         .reset_index(drop=True)
     )
+
+
+def preload_function_minute_series(
+    eval_keys: list[tuple[str, str]],
+    data_dir: Path,
+    *,
+    freq: str = "1min",
+) -> dict[tuple[str, str], pd.Series]:
+    """
+    Load 1-minute series for all evaluation functions in one pass per daily CSV.
+
+    Avoids re-reading every day file once per function (the main az19 memory trap).
+    """
+    if not eval_keys:
+        return {}
+
+    keys_df = pd.DataFrame(eval_keys, columns=["HashApp", "HashFunction"])
+    long_frames: list[pd.DataFrame] = []
+
+    for path in sorted(data_dir.glob("invocations_per_function*.csv")):
+        day = int(re.search(r"\.d(\d+)\.csv$", path.name).group(1))
+        _log_phase(f"preload {path.name} ({len(eval_keys)} eval functions)")
+        day_df = pd.read_csv(path, usecols=DAY_CSV_USECOLS)
+        day_df = day_df.merge(keys_df, on=["HashApp", "HashFunction"], how="inner")
+        if day_df.empty:
+            continue
+        long = day_df.melt(
+            id_vars=["HashApp", "HashFunction"],
+            value_vars=MINUTE_COLS,
+            var_name="minute",
+            value_name="count",
+        )
+        long["minute"] = long["minute"].astype(int)
+        long["timestamp"] = (
+            TRACE_START
+            + pd.Timedelta(days=day - 1)
+            + pd.to_timedelta(long["minute"] - 1, unit="m")
+        )
+        long_frames.append(long[["HashApp", "HashFunction", "timestamp", "count"]])
+
+    if not long_frames:
+        return {}
+
+    all_long = pd.concat(long_frames, ignore_index=True)
+    minutes = trace_minutes(freq)
+    series_by_key: dict[tuple[str, str], pd.Series] = {}
+    for (app, func), group in all_long.groupby(
+        ["HashApp", "HashFunction"], sort=False
+    ):
+        series = group.groupby("timestamp")["count"].sum()
+        series.index = pd.DatetimeIndex(series.index, tz="UTC")
+        series_by_key[(app, func)] = series.reindex(minutes, fill_value=0).astype(int)
+    return series_by_key
 
 
 def trace_minutes(freq: str = "1min") -> pd.DatetimeIndex:
@@ -120,13 +192,14 @@ def load_or_build_metadata(
         print(f"Loading metadata from {metadata_path}")
         return pd.read_csv(metadata_path)
 
-    print("Building function metadata (one CSV scan)...")
+    print("Building function metadata (one CSV scan)...", flush=True)
     t0 = time.perf_counter()
     metadata = build_minute_bin_function_metadata(
         data_dir,
         minute_cols=MINUTE_COLS,
         min_invocations=min_invocations,
         trace_minutes=TRACE_DAYS * 1440,
+        log=_log_phase,
     )
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
     metadata.to_csv(metadata_path, index=False)
@@ -143,6 +216,9 @@ def run_sample_holdout(
     season_days: int,
     include_m7: bool,
     include_ma1: bool,
+    include_prophet: bool,
+    include_auto_arima: bool,
+    verbose: bool,
 ) -> pd.DataFrame:
     if not eval_keys:
         return pd.DataFrame()
@@ -153,17 +229,33 @@ def run_sample_holdout(
         season_days=season_days,
         include_seasonal_arima=False,
         include_ma1=include_ma1,
+        include_prophet=include_prophet,
+        include_auto_arima=include_auto_arima,
     )
+    print(f"  models: {[f.name for f in forecasters]}", flush=True)
+
+    _log_phase(f"preloading minute series for {len(eval_keys)} functions")
+    series_by_key = preload_function_minute_series(
+        eval_keys, data_dir, freq=freq
+    )
+    _log_phase(f"preloaded {len(series_by_key)} series")
 
     rows: list[dict] = []
     t0 = time.perf_counter()
     for i, (app, func) in enumerate(eval_keys, start=1):
-        series = function_minute_series(app, func, data_dir=data_dir, freq=freq)
+        series = series_by_key.get((app, func))
+        if series is None:
+            continue
         split = temporal_split(series)
         if split is None:
             continue
 
         for forecaster in forecasters:
+            if verbose:
+                print(
+                    f"  {i}/{len(eval_keys)} {app[:8]}…/{func[:8]}… {forecaster.name}",
+                    flush=True,
+                )
             try:
                 result = evaluate_series(
                     split.train,
@@ -211,12 +303,17 @@ def run_aggregate(
     season_days: int,
     include_m7: bool,
     include_ma1: bool,
+    include_prophet: bool,
+    include_auto_arima: bool,
+    verbose: bool,
 ) -> pd.DataFrame:
     forecasters = default_holdout_forecasters(
         freq=freq,
         season_days=season_days,
         include_seasonal_arima=False,
         include_ma1=include_ma1,
+        include_prophet=include_prophet,
+        include_auto_arima=include_auto_arima,
     )
     split = temporal_split(total_series)
     if split is None:
@@ -224,6 +321,8 @@ def run_aggregate(
 
     rows: list[dict] = []
     for forecaster in forecasters:
+        if verbose:
+            print(f"  aggregate {forecaster.name}", flush=True)
         try:
             result = evaluate_series(
                 split.train,
@@ -330,6 +429,21 @@ def parse_args() -> argparse.Namespace:
         help="Skip MASE/RMSSE with 7-day seasonal-naive scaling (mase_m7, rmsse_m7)",
     )
     parser.add_argument(
+        "--no-prophet",
+        action="store_true",
+        help="Exclude Prophet (CmdStan); often needed on headless Linux hosts",
+    )
+    parser.add_argument(
+        "--no-auto-arima",
+        action="store_true",
+        help="Exclude pmdarima auto-ARIMA search",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print each (function, model) fit (helps locate native crashes)",
+    )
+    parser.add_argument(
         "--skip-aggregate",
         action="store_true",
         help="Skip platform-wide aggregate holdout",
@@ -344,11 +458,18 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    global _T0
+    _T0 = time.perf_counter()
+    _log_phase("starting")
+
     args = parse_args()
     metadata_path = args.metadata_path or (args.data_dir / "function_metadata.csv")
     include_m7 = not args.no_m7
     include_ma1 = not args.no_ma1
+    include_prophet = not args.no_prophet
+    include_auto_arima = not args.no_auto_arima
 
+    _log_phase("loading metadata")
     function_metadata = load_or_build_metadata(
         args.data_dir,
         metadata_path=metadata_path,
@@ -369,6 +490,7 @@ def main() -> None:
     print(f"Evaluation sample: {len(eval_keys):,}")
     print(eval_manifest["sample_tier"].value_counts().to_string())
 
+    _log_phase("starting per-function holdout")
     holdout_results = run_sample_holdout(
         eval_keys,
         data_dir=args.data_dir,
@@ -376,6 +498,9 @@ def main() -> None:
         season_days=args.season_days,
         include_m7=include_m7,
         include_ma1=include_ma1,
+        include_prophet=include_prophet,
+        include_auto_arima=include_auto_arima,
+        verbose=args.verbose,
     )
 
     print("\n## Per-function holdout — macro (each function counts equally)")
@@ -394,6 +519,7 @@ def main() -> None:
 
     aggregate_results = pd.DataFrame()
     if not args.skip_aggregate:
+        _log_phase("loading platform-wide minute series")
         print("\nLoading platform-wide minute series...")
         total_series = (
             load_total_invocations_per_minute(args.data_dir)
@@ -405,6 +531,9 @@ def main() -> None:
             season_days=args.season_days,
             include_m7=include_m7,
             include_ma1=include_ma1,
+            include_prophet=include_prophet,
+            include_auto_arima=include_auto_arima,
+            verbose=args.verbose,
         )
         print("\n## All-invocation aggregate holdout")
         agg_sort = "mase_m7" if include_m7 else "mase_m1"
