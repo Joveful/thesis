@@ -16,11 +16,13 @@ for _var in (
     os.environ.setdefault(_var, "1")
 
 import argparse
+import gc
 import re
 import time
 import warnings
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
@@ -86,57 +88,65 @@ def load_function_invocations(
     )
 
 
+DAY_CSV_USECOLS = ["HashApp", "HashFunction", *MINUTE_COLS]
+MINUTE_DTYPES = {col: np.int32 for col in MINUTE_COLS}
+
+
 def preload_function_minute_series(
     eval_keys: list[tuple[str, str]],
     data_dir: Path,
     *,
     freq: str = "1min",
+    chunk_size: int = 2000,
 ) -> dict[tuple[str, str], pd.Series]:
     """
     Load 1-minute series for all evaluation functions in one pass per daily CSV.
 
-    Avoids re-reading every day file once per function (the main az19 memory trap).
+    Uses chunked reads and in-place numpy buffers (no melt/concat) to keep peak
+    memory flat across large day files such as d12.
     """
     if not eval_keys:
         return {}
 
+    n_minutes = TRACE_DAYS * 1440
+    minutes = trace_minutes(freq)
+    key_to_idx = {key: idx for idx, key in enumerate(eval_keys)}
+    accum = np.zeros((len(eval_keys), n_minutes), dtype=np.int32)
     keys_df = pd.DataFrame(eval_keys, columns=["HashApp", "HashFunction"])
-    long_frames: list[pd.DataFrame] = []
 
     for path in sorted(data_dir.glob("invocations_per_function*.csv")):
         day = int(re.search(r"\.d(\d+)\.csv$", path.name).group(1))
+        day_start = (day - 1) * 1440
         _log_phase(f"preload {path.name} ({len(eval_keys)} eval functions)")
-        day_df = pd.read_csv(path, usecols=DAY_CSV_USECOLS)
-        day_df = day_df.merge(keys_df, on=["HashApp", "HashFunction"], how="inner")
-        if day_df.empty:
-            continue
-        long = day_df.melt(
-            id_vars=["HashApp", "HashFunction"],
-            value_vars=MINUTE_COLS,
-            var_name="minute",
-            value_name="count",
-        )
-        long["minute"] = long["minute"].astype(int)
-        long["timestamp"] = (
-            TRACE_START
-            + pd.Timedelta(days=day - 1)
-            + pd.to_timedelta(long["minute"] - 1, unit="m")
-        )
-        long_frames.append(long[["HashApp", "HashFunction", "timestamp", "count"]])
+        for chunk in pd.read_csv(
+            path,
+            usecols=DAY_CSV_USECOLS,
+            dtype=MINUTE_DTYPES,
+            chunksize=chunk_size,
+        ):
+            filtered = chunk.merge(
+                keys_df, on=["HashApp", "HashFunction"], how="inner"
+            )
+            del chunk
+            if filtered.empty:
+                continue
+            for (app, func), group in filtered.groupby(
+                ["HashApp", "HashFunction"], sort=False
+            ):
+                idx = key_to_idx.get((app, func))
+                if idx is None:
+                    continue
+                day_counts = group[MINUTE_COLS].sum(axis=0, numeric_only=True)
+                accum[idx, day_start : day_start + 1440] += day_counts.to_numpy(
+                    dtype=np.int32
+                )
+            del filtered
+        gc.collect()
 
-    if not long_frames:
-        return {}
-
-    all_long = pd.concat(long_frames, ignore_index=True)
-    minutes = trace_minutes(freq)
-    series_by_key: dict[tuple[str, str], pd.Series] = {}
-    for (app, func), group in all_long.groupby(
-        ["HashApp", "HashFunction"], sort=False
-    ):
-        series = group.groupby("timestamp")["count"].sum()
-        series.index = pd.DatetimeIndex(series.index, tz="UTC")
-        series_by_key[(app, func)] = series.reindex(minutes, fill_value=0).astype(int)
-    return series_by_key
+    return {
+        key: pd.Series(accum[idx], index=minutes, dtype=int)
+        for key, idx in key_to_idx.items()
+    }
 
 
 def trace_minutes(freq: str = "1min") -> pd.DatetimeIndex:
@@ -219,6 +229,7 @@ def run_sample_holdout(
     include_prophet: bool,
     include_auto_arima: bool,
     verbose: bool,
+    preload_chunk_size: int,
 ) -> pd.DataFrame:
     if not eval_keys:
         return pd.DataFrame()
@@ -236,7 +247,7 @@ def run_sample_holdout(
 
     _log_phase(f"preloading minute series for {len(eval_keys)} functions")
     series_by_key = preload_function_minute_series(
-        eval_keys, data_dir, freq=freq
+        eval_keys, data_dir, freq=freq, chunk_size=preload_chunk_size
     )
     _log_phase(f"preloaded {len(series_by_key)} series")
 
@@ -444,6 +455,12 @@ def parse_args() -> argparse.Namespace:
         help="Print each (function, model) fit (helps locate native crashes)",
     )
     parser.add_argument(
+        "--preload-chunk-size",
+        type=int,
+        default=2000,
+        help="Rows per chunk when preloading daily CSVs (lower = less RAM)",
+    )
+    parser.add_argument(
         "--skip-aggregate",
         action="store_true",
         help="Skip platform-wide aggregate holdout",
@@ -501,6 +518,7 @@ def main() -> None:
         include_prophet=include_prophet,
         include_auto_arima=include_auto_arima,
         verbose=args.verbose,
+        preload_chunk_size=args.preload_chunk_size,
     )
 
     print("\n## Per-function holdout — macro (each function counts equally)")
