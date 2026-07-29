@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol, TypeVar
 
 import matplotlib.pyplot as plt
@@ -319,9 +320,9 @@ class AutoARIMAForecaster:
 
     def __init__(
         self,
-        max_p: int = 5,
+        max_p: int = 4,
         max_d: int = 2,
-        max_q: int = 5,
+        max_q: int = 4,
         seasonal: bool = False,
         **auto_arima_kwargs,
     ) -> None:
@@ -502,10 +503,12 @@ class ProphetForecaster:
         if len(y) < 20:
             raise ValueError("train series too short for Prophet")
 
-        dfp = pd.DataFrame({"ds": y.index, "y": y.astype(float).values})
+        ds = y.index
+        if isinstance(ds, pd.DatetimeIndex) and ds.tz is not None:
+            ds = ds.tz_localize(None)
+        dfp = pd.DataFrame({"ds": ds, "y": y.astype(float).values})
         self._model = Prophet(
             growth="flat",
-            seasonality_mode="multiplicative",
             daily_seasonality=self.daily_seasonality,
             weekly_seasonality=self.weekly_seasonality,
             yearly_seasonality=self.yearly_seasonality,
@@ -626,12 +629,12 @@ def evaluate_series(
     *,
     freq: str = "5min",
     season_days: int = 7,
+    include_m7: bool = True,
 ) -> dict:
     model = forecaster
     model.fit(y_train)
     y_pred = model.predict(len(y_test))
-    m7 = _season_length_m7(freq, season_days)
-    return {
+    result = {
         "model": model.name,
         "n_train": len(y_train),
         "n_test": len(y_test),
@@ -639,10 +642,13 @@ def evaluate_series(
         "rmse": _rmse(y_test, y_pred),
         "mase_m1": mase(y_test, y_pred, y_train, 1),
         "rmsse_m1": rmsse(y_test, y_pred, y_train, 1),
-        "mase_m7": mase(y_test, y_pred, y_train, m7),
-        "rmsse_m7": rmsse(y_test, y_pred, y_train, m7),
         "y_pred": y_pred,
     }
+    if include_m7:
+        m7 = _season_length_m7(freq, season_days)
+        result["mase_m7"] = mase(y_test, y_pred, y_train, m7)
+        result["rmsse_m7"] = rmsse(y_test, y_pred, y_train, m7)
+    return result
 
 
 def evaluate_trace(
@@ -657,6 +663,7 @@ def evaluate_trace(
     keys: list[tuple[str, str]] | None = None,
     max_functions: int | None = None,
     season_days: int = 1,
+    include_m7: bool = True,
 ) -> pd.DataFrame:
     """
     Evaluate forecasters on trace data; one result row per (app, func, model).
@@ -700,6 +707,7 @@ def evaluate_trace(
                     forecaster,
                     freq=freq,
                     season_days=season_days,
+                    include_m7=include_m7,
                 )
             except Exception as exc:
                 print(f"skip {app[:8]}…/{func[:8]}… {forecaster.name}: {exc}")
@@ -714,8 +722,14 @@ def evaluate_trace(
                     "n_test": result["n_test"],
                     "mase_m1": result["mase_m1"],
                     "rmsse_m1": result["rmsse_m1"],
-                    "mase_m7": result["mase_m7"],
-                    "rmsse_m7": result["rmsse_m7"],
+                    **(
+                        {
+                            "mase_m7": result["mase_m7"],
+                            "rmsse_m7": result["rmsse_m7"],
+                        }
+                        if include_m7
+                        else {}
+                    ),
                 }
             )
 
@@ -731,6 +745,7 @@ def evaluate_total_invocations(
     min_train_points: int = 48,
     min_test_points: int = 12,
     season_days: int = 1,
+    include_m7: bool = True,
 ) -> pd.DataFrame:
     """
     Holdout evaluation on one series aggregating all function invocations.
@@ -754,6 +769,7 @@ def evaluate_total_invocations(
                 forecaster,
                 freq=freq,
                 season_days=season_days,
+                include_m7=include_m7,
             )
         except Exception as exc:
             print(f"skip {forecaster.name}: {exc}")
@@ -770,8 +786,14 @@ def evaluate_total_invocations(
                 "rmse": result["rmse"],
                 "mase_m1": result["mase_m1"],
                 "rmsse_m1": result["rmsse_m1"],
-                "mase_m7": result["mase_m7"],
-                "rmsse_m7": result["rmsse_m7"],
+                **(
+                    {
+                        "mase_m7": result["mase_m7"],
+                        "rmsse_m7": result["rmsse_m7"],
+                    }
+                    if include_m7
+                    else {}
+                ),
             }
         )
 
@@ -1030,27 +1052,35 @@ def plot_holdout(
     return ax
 
 
-def default_baselines(freq: str = "5min", season_days: int = 1) -> list[Forecaster]:
+def default_baselines(
+    freq: str = "5min",
+    season_days: int = 1,
+    *,
+    include_ma1: bool = True,
+) -> list[Forecaster]:
     """Standard baseline forecasters for experiments."""
-    return [
+    models: list[Forecaster] = [
         NaiveForecaster(),
         SeasonalNaiveForecaster(
             freq=freq,
             season_length=_default_season_length(freq, days=season_days),
         ),
-        MA1Forecaster(),
     ]
+    if include_ma1:
+        models.append(MA1Forecaster())
+    return models
 
 
 def default_forecasters(
     freq: str = "5min",
     *,
+    include_ma1: bool = True,
     include_arima: bool = True,
     include_prophet: bool = True,
     arima_order: tuple[int, int, int] = (2, 1, 2),
 ) -> list[Forecaster]:
     """Baselines plus fixed-order ARIMA and Prophet (used by CV)."""
-    models: list[Forecaster] = default_baselines(freq)
+    models: list[Forecaster] = default_baselines(freq, include_ma1=include_ma1)
     if include_arima:
         models.append(ARIMAForecaster(order=arima_order))
     if include_prophet:
@@ -1063,6 +1093,7 @@ def default_holdout_forecasters(
     *,
     season_days: int = 7,
     sarima_season_days: int = 1,
+    include_ma1: bool = True,
     include_auto_arima: bool = True,
     include_seasonal_arima: bool = True,
     include_prophet: bool = True,
@@ -1071,7 +1102,9 @@ def default_holdout_forecasters(
     max_q: int = 5,
 ) -> list[Forecaster]:
     """Baselines plus holdout-only models (AR1, SES, DES, auto-ARIMA, SARIMA, Prophet)."""
-    models: list[Forecaster] = default_baselines(freq, season_days=season_days)
+    models: list[Forecaster] = default_baselines(
+        freq, season_days=season_days, include_ma1=include_ma1
+    )
     models.extend(
         [
             AR1Forecaster(),
@@ -1156,3 +1189,166 @@ def top_function_keys(
     counts = counts[counts >= min_invocations]
     top = counts.nlargest(n)
     return list(top.index)
+
+
+def build_minute_bin_function_metadata(
+    data_dir: Path | str,
+    *,
+    minute_cols: list[str],
+    app_col: str = "HashApp",
+    func_col: str = "HashFunction",
+    trigger_col: str = "Trigger",
+    min_invocations: int = 50,
+    trace_minutes: int = 14 * 1440,
+    n_volume_bins: int = 5,
+    n_activity_bins: int = 3,
+) -> pd.DataFrame:
+    """
+    Build per-function metadata from Azure 2019-style minute-count CSVs.
+
+    Returns one row per eligible function with volume/activity bins for
+    stratified sampling.
+    """
+    data_dir = Path(data_dir)
+    usecols = [app_col, func_col, trigger_col, *minute_cols]
+    totals: dict[tuple[str, str], int] = {}
+    active: dict[tuple[str, str], int] = {}
+    triggers: dict[tuple[str, str], str] = {}
+
+    for path in sorted(data_dir.glob("invocations_per_function*.csv")):
+        day_df = pd.read_csv(path, usecols=usecols)
+        minute_totals = day_df[minute_cols].sum(axis=1).astype(np.int64)
+        active_minutes = (day_df[minute_cols].to_numpy(dtype=np.int32) > 0).sum(
+            axis=1
+        )
+        for app, func, trigger, total, active_count in zip(
+            day_df[app_col],
+            day_df[func_col],
+            day_df[trigger_col],
+            minute_totals,
+            active_minutes,
+        ):
+            key = (app, func)
+            if key not in triggers:
+                triggers[key] = trigger
+            totals[key] = totals.get(key, 0) + int(total)
+            active[key] = active.get(key, 0) + int(active_count)
+
+    rows: list[dict] = []
+    for (app, func), invocations in totals.items():
+        if invocations < min_invocations:
+            continue
+        active_minutes = active[(app, func)]
+        rows.append(
+            {
+                "app": app,
+                "func": func,
+                "trigger": triggers[(app, func)],
+                "invocations": invocations,
+                "active_minutes": active_minutes,
+                "active_frac": active_minutes / trace_minutes,
+            }
+        )
+
+    metadata = pd.DataFrame(rows)
+    if metadata.empty:
+        return metadata
+
+    metadata["inv_bin"] = pd.qcut(
+        metadata["invocations"],
+        q=n_volume_bins,
+        labels=[f"Q{i}" for i in range(1, n_volume_bins + 1)],
+        duplicates="drop",
+    )
+    metadata["activity_bin"] = pd.qcut(
+        metadata["active_frac"],
+        q=n_activity_bins,
+        labels=[f"A{i}" for i in range(1, n_activity_bins + 1)],
+        duplicates="drop",
+    )
+    return metadata.sort_values("invocations", ascending=False).reset_index(drop=True)
+
+
+def sample_representative_functions(
+    metadata: pd.DataFrame,
+    *,
+    census_n: int = 30,
+    per_cell_k: int = 5,
+    seed: int = 42,
+    stratify_cols: tuple[str, ...] = ("inv_bin", "trigger"),
+) -> tuple[list[tuple[str, str]], pd.DataFrame]:
+    """
+    Hybrid census + stratified sample for representative forecast evaluation.
+
+    Always includes the top ``census_n`` functions by invocation volume, then
+    draws up to ``per_cell_k`` functions from each remaining
+    (volume_bin, trigger) cell.
+    """
+    if metadata.empty:
+        return [], metadata.iloc[0:0].copy()
+
+    work = metadata.copy()
+    work["key"] = list(zip(work["app"], work["func"]))
+    ranked = work.sort_values("invocations", ascending=False)
+
+    census = ranked.head(census_n).copy()
+    census["sample_tier"] = "census"
+
+    remaining = ranked.iloc[census_n:].copy()
+    sampled_parts = [census]
+    rng = np.random.default_rng(seed)
+
+    for _, group in remaining.groupby(list(stratify_cols), observed=True):
+        n_take = min(per_cell_k, len(group))
+        idx = rng.choice(group.index.to_numpy(), size=n_take, replace=False)
+        part = group.loc[idx].copy()
+        part["sample_tier"] = "stratified"
+        sampled_parts.append(part)
+
+    manifest = (
+        pd.concat(sampled_parts, ignore_index=True)
+        .drop_duplicates(subset=["app", "func"], keep="first")
+        .sort_values("invocations", ascending=False)
+        .reset_index(drop=True)
+    )
+    eval_keys = list(zip(manifest["app"], manifest["func"]))
+    return eval_keys, manifest
+
+
+def summarize_results_weighted(
+    results: pd.DataFrame,
+    metadata: pd.DataFrame,
+    *,
+    weight_col: str = "invocations",
+    group_auto_arima: bool = True,
+    sort_by: str = "mase_m7_weighted",
+) -> pd.DataFrame:
+    """Invocation-weighted mean MASE/RMSSE per model (micro average)."""
+    if results.empty:
+        return results
+
+    weights = metadata[["app", "func", weight_col]]
+    work = results.merge(weights, on=["app", "func"], how="left")
+    if group_auto_arima:
+        work["model"] = work["model"].map(_model_group)
+
+    metric_cols = [
+        c
+        for c in ("mase_m1", "rmsse_m1", "mase_m7", "rmsse_m7", "mase", "rmsse")
+        if c in work.columns
+    ]
+    rows: list[dict] = []
+    for model, group in work.groupby("model", sort=False):
+        w = group[weight_col].to_numpy(dtype=float)
+        if np.sum(w) <= 0:
+            continue
+        row: dict = {"model": model, "n_functions": group["func"].nunique()}
+        for col in metric_cols:
+            vals = group[col].to_numpy(dtype=float)
+            row[f"{col}_weighted"] = float(np.average(vals, weights=w))
+        rows.append(row)
+
+    out = pd.DataFrame(rows)
+    if sort_by in out.columns:
+        return out.sort_values(sort_by)
+    return out
