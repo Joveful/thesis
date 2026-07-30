@@ -72,19 +72,72 @@ DAY_CSV_USECOLS = ["HashApp", "HashFunction", *MINUTE_COLS]
 MINUTE_DTYPES = {col: np.int32 for col in MINUTE_COLS}
 
 
+def _validate_freq(freq: str) -> str:
+    """Pandas offset for eval buckets; source data is per-minute."""
+    td = pd.Timedelta(freq)
+    if td <= pd.Timedelta(0):
+        raise ValueError(f"freq must be a positive pandas offset, got {freq!r}")
+    if td < pd.Timedelta("1min"):
+        raise ValueError(
+            f"freq must be >= 1min (Azure 2019 CSVs are minute bins), got {freq!r}"
+        )
+    return freq
+
+
+def trace_minute_count() -> int:
+    return TRACE_DAYS * 1440
+
+
+def minute_index() -> pd.DatetimeIndex:
+    return pd.date_range(
+        TRACE_START,
+        periods=trace_minute_count(),
+        freq="1min",
+        tz="UTC",
+    )
+
+
+def trace_index(freq: str = "1min") -> pd.DatetimeIndex:
+    """Datetime index spanning the trace at the evaluation frequency."""
+    freq = _validate_freq(freq)
+    periods = max(1, int(pd.Timedelta(days=TRACE_DAYS) / pd.Timedelta(freq)))
+    return pd.date_range(TRACE_START, periods=periods, freq=freq, tz="UTC")
+
+
+def trace_minutes(freq: str = "1min") -> pd.DatetimeIndex:
+    """Alias for trace_index (minute-native CSV layout resampled to freq)."""
+    return trace_index(freq)
+
+
+def series_at_freq(minute_values: np.ndarray, freq: str) -> pd.Series:
+    """Build an eval-frequency count series from per-minute counts."""
+    freq = _validate_freq(freq)
+    minute_series = pd.Series(minute_values, index=minute_index(), dtype=np.int64)
+    if pd.Timedelta(freq) <= pd.Timedelta("1min"):
+        return minute_series.astype(int)
+    return minute_series.resample(freq).sum().astype(int)
+
+
+def resample_series(series: pd.Series, freq: str) -> pd.Series:
+    """Resample a minute-indexed (or reindexable) series to eval frequency."""
+    freq = _validate_freq(freq)
+    minute_series = series.reindex(minute_index(), fill_value=0).astype(np.int64)
+    if pd.Timedelta(freq) <= pd.Timedelta("1min"):
+        return minute_series.astype(int)
+    return minute_series.resample(freq).sum().astype(int)
+
+
 def _day_from_path(path: Path) -> int:
     return int(re.search(r"\.d(\d+)\.csv$", path.name).group(1))
 
 
 def _preload_init_buffers(
     eval_keys: list[tuple[str, str]],
-    freq: str,
-) -> tuple[dict[tuple[str, str], int], np.ndarray, pd.DatetimeIndex]:
-    n_minutes = TRACE_DAYS * 1440
+) -> tuple[dict[tuple[str, str], int], np.ndarray]:
+    n_minutes = trace_minute_count()
     return (
         {key: idx for idx, key in enumerate(eval_keys)},
         np.zeros((len(eval_keys), n_minutes), dtype=np.int32),
-        trace_minutes(freq),
     )
 
 
@@ -116,7 +169,7 @@ def _preload_function_minute_series_csv(
     if not eval_keys:
         return {}
 
-    key_to_idx, accum, minutes = _preload_init_buffers(eval_keys, freq)
+    key_to_idx, accum = _preload_init_buffers(eval_keys)
 
     for path in sorted(data_dir.glob("invocations_per_function*.csv")):
         day_start = (_day_from_path(path) - 1) * 1440
@@ -132,7 +185,7 @@ def _preload_function_minute_series_csv(
                 )
 
     return {
-        key: pd.Series(accum[idx], index=minutes, dtype=int)
+        key: series_at_freq(accum[idx], freq)
         for key, idx in key_to_idx.items()
     }
 
@@ -148,7 +201,7 @@ def _preload_function_minute_series_pandas(
     if not eval_keys:
         return {}
 
-    key_to_idx, accum, minutes = _preload_init_buffers(eval_keys, freq)
+    key_to_idx, accum = _preload_init_buffers(eval_keys)
     keys_df = pd.DataFrame(eval_keys, columns=["HashApp", "HashFunction"])
 
     for path in sorted(data_dir.glob("invocations_per_function*.csv")):
@@ -180,7 +233,7 @@ def _preload_function_minute_series_pandas(
         gc.collect()
 
     return {
-        key: pd.Series(accum[idx], index=minutes, dtype=int)
+        key: series_at_freq(accum[idx], freq)
         for key, idx in key_to_idx.items()
     }
 
@@ -236,15 +289,6 @@ def load_function_invocations(
     )
 
 
-def trace_minutes(freq: str = "1min") -> pd.DatetimeIndex:
-    return pd.date_range(
-        TRACE_START,
-        periods=TRACE_DAYS * 1440,
-        freq=freq,
-        tz="UTC",
-    )
-
-
 def function_minute_series(
     app: str,
     func: str,
@@ -252,11 +296,12 @@ def function_minute_series(
     data_dir: Path = DEFAULT_DATA,
     freq: str = "1min",
 ) -> pd.Series:
-    """1-minute invocation counts for one function across the trace."""
+    """Invocation counts for one function across the trace at eval frequency."""
     long = load_function_invocations(app, func, data_dir=data_dir)
     series = long.groupby("timestamp")["count"].sum()
     series.index = pd.DatetimeIndex(series.index, tz="UTC")
-    return series.reindex(trace_minutes(freq), fill_value=0).astype(int)
+    minute_series = series.reindex(minute_index(), fill_value=0).astype(int)
+    return resample_series(minute_series, freq)
 
 
 def load_total_invocations_per_minute(data_dir: Path = DEFAULT_DATA) -> pd.Series:
@@ -333,7 +378,7 @@ def run_sample_holdout(
     )
     print(f"  models: {[f.name for f in forecasters]}", flush=True)
 
-    _log_phase(f"preloading minute series for {len(eval_keys)} functions")
+    _log_phase(f"preloading series at freq={freq!r} for {len(eval_keys)} functions")
     series_by_key = preload_function_minute_series(
         eval_keys,
         data_dir,
@@ -479,7 +524,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Cached function metadata CSV (default: <data-dir>/function_metadata.csv)",
     )
-    parser.add_argument("--freq", default="1min", help="Series frequency")
+    parser.add_argument(
+        "--freq",
+        default="1min",
+        help=(
+            "Evaluation bucket size (pandas offset). Source CSVs are per-minute; "
+            "coarser bins sum minute counts. Examples: 1min, 5min, 15min, 1h"
+        ),
+    )
     parser.add_argument(
         "--season-days",
         type=int,
@@ -578,6 +630,7 @@ def main() -> None:
     _log_phase("starting")
 
     args = parse_args()
+    _validate_freq(args.freq)
     metadata_path = args.metadata_path or (args.data_dir / "function_metadata.csv")
     include_m7 = not args.no_m7
     include_ma1 = not args.no_ma1
@@ -603,6 +656,7 @@ def main() -> None:
 
     print(f"Eligible functions: {len(function_metadata):,}")
     print(f"Evaluation sample: {len(eval_keys):,}")
+    print(f"Eval frequency: {args.freq} ({len(trace_index(args.freq)):,} buckets / trace)")
     print(eval_manifest["sample_tier"].value_counts().to_string())
 
     _log_phase("starting per-function holdout")
@@ -636,11 +690,11 @@ def main() -> None:
 
     aggregate_results = pd.DataFrame()
     if not args.skip_aggregate:
-        _log_phase("loading platform-wide minute series")
-        print("\nLoading platform-wide minute series...")
-        total_series = (
-            load_total_invocations_per_minute(args.data_dir)
-            .reindex(trace_minutes(args.freq), fill_value=0)
+        _log_phase(f"loading platform-wide series at freq={args.freq!r}")
+        print(f"\nLoading platform-wide series at {args.freq}...")
+        total_series = resample_series(
+            load_total_invocations_per_minute(args.data_dir),
+            args.freq,
         )
         aggregate_results = run_aggregate(
             total_series,
